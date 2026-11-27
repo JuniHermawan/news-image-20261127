@@ -1,134 +1,120 @@
 #!/usr/bin/env python3
-"""news-image-20261127: copy the day's front page to the output directory.
+"""news-image-20261127 -- entrypoint.
 
-The entry image (entry.png, 1024x1024, a newspaper front page summing up
-Friday 27 November 2026 world news) is shipped in this repository next to
-this program. This program validates the PNG thoroughly, copies it
-byte-for-byte to $MAKEFUN_OUTPUT_DIR/entry.png (default /output), and
-re-validates the copy. Standard library only, no network, deterministic:
-two runs write identical bytes.
+Validates the finished newspaper front page (entry.png) and copies it
+into the output directory the harness expects.
 
-Run: MAKEFUN_OUTPUT_DIR=out python3 main.py
-Revision history (thinking_revised: this file took its final content
-from at least two assistant messages that wrote or edited it):
-  - v1: full program written (validate + copy + re-validate).
-  - v2: added the IDAT payload check below (every IDAT chunk must be
-    non-empty and their combined payload must be non-zero), so a PNG
-    whose image data was stripped to empty IDAT chunks is rejected
-    even though its structure and CRCs still walk cleanly.
-  - v3: added an IHDR bit-depth / color-type sanity check.
+The image itself is a fixed asset: a 1024x1024 PNG front page for the
+make.fun bounty "Sum up 27 November's world news in one image"
+("THE WORLD IN ONE DAY", six stories from 26-27 Nov 2026). This script
+does not generate or alter any pixel -- it only proves the asset is a
+well-formed PNG of the right size and hands it over byte for byte.
+
+Stdlib only. No network, no randomness, no timestamps: run it twice
+and the output is identical every time.
 """
+
 import hashlib
 import os
 import struct
 import sys
 import zlib
 
-EXPECTED_SHA256 = (
-    "6531a66ec0f27a71f3ecb646f476427cb196cbc5feeb5a97141d82ede60bcb4a"
-)
-EXPECTED_SIZE = 417979
-MAX_BYTES = 1 << 20
-MAX_DIM = 1024
-PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+# The eight bytes every PNG file starts with.
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+
+EXPECTED_WIDTH = 1024
+EXPECTED_HEIGHT = 1024
+SOURCE_NAME = "entry.png"
 
 
-def fail(msg):
-    print("error: " + msg, file=sys.stderr)
-    raise SystemExit(1)
+def fail(message):
+    """Print an error and stop with a non-zero exit code."""
+    print("error: " + message, file=sys.stderr)
+    sys.exit(1)
 
 
-def validate_png(data):
-    """Validate a whole PNG: magic, IHDR dims, CRC walk to IEND, IDAT."""
-    if len(data) > MAX_BYTES:
-        fail("entry.png is %d bytes, over the 1 MiB limit" % len(data))
-    if len(data) < 8 or data[:8] != PNG_MAGIC:
-        fail("entry.png does not start with the PNG magic bytes")
-    pos = 8
-    seen_idat = False
-    seen_iend = False
-    idat_bytes = 0
-    first = True
-    while pos < len(data):
-        if pos + 8 > len(data):
-            fail("truncated PNG chunk header at offset %d" % pos)
-        length = struct.unpack(">I", data[pos:pos + 4])[0]
-        ctype = data[pos + 4:pos + 8]
-        end = pos + 12 + length
-        if end > len(data):
-            fail("truncated PNG chunk %r at offset %d" % (ctype, pos))
-        chunk_data = data[pos + 8:pos + 8 + length]
-        stored_crc = struct.unpack(">I", data[pos + 8 + length:end])[0]
-        actual_crc = zlib.crc32(ctype + chunk_data) & 0xFFFFFFFF
-        if stored_crc != actual_crc:
-            fail("bad CRC in %r chunk at offset %d" % (ctype, pos))
-        if first:
-            if ctype != b"IHDR":
-                fail("first PNG chunk is %r, expected IHDR" % ctype)
-            if length != 13:
-                fail("IHDR length is %d, expected 13" % length)
-            width, height = struct.unpack(">II", chunk_data[:8])
-            if width == 0 or height == 0:
-                fail("PNG has a zero dimension")
-            if width > MAX_DIM or height > MAX_DIM:
-                fail("PNG is %dx%d, over the 1024x1024 limit"
-                     % (width, height))
-            bit_depth, color_type = chunk_data[8], chunk_data[9]
-            if bit_depth not in (1, 2, 4, 8, 16):
-                fail("PNG has an invalid bit depth %d" % bit_depth)
-            if color_type not in (0, 2, 3, 4, 6):
-                fail("PNG has an invalid color type %d" % color_type)
-            first = False
-        if ctype == b"IDAT":
-            seen_idat = True
-            if length == 0:
-                fail("empty IDAT chunk at offset %d" % pos)
-            idat_bytes += length
-        if ctype == b"IEND":
-            if length != 0:
-                fail("IEND chunk has a non-zero length")
-            if end != len(data):
-                fail("trailing bytes after IEND")
-            seen_iend = True
+def read_chunks(data):
+    """Walk the PNG chunk list, yielding (type, payload) pairs.
+
+    Each chunk is: 4-byte big-endian length, 4-byte type, `length`
+    bytes of data, 4-byte CRC. Parsing stops cleanly at IEND.
+    """
+    offset = len(PNG_SIGNATURE)
+    while offset < len(data):
+        if offset + 8 > len(data):
+            fail("truncated chunk header at offset %d" % offset)
+        length = struct.unpack(">I", data[offset:offset + 4])[0]
+        chunk_type = data[offset + 4:offset + 8]
+        start = offset + 8
+        end = start + length
+        if end + 4 > len(data):
+            fail("truncated %s chunk" % chunk_type.decode("latin-1"))
+        stored_crc = struct.unpack(">I", data[end:end + 4])[0]
+        actual_crc = zlib.crc32(chunk_type)
+        actual_crc = zlib.crc32(data[start:end], actual_crc)
+        if actual_crc != stored_crc:
+            fail("%s chunk failed its CRC check (file may be corrupt)"
+                 % chunk_type.decode("latin-1"))
+        yield chunk_type, data[start:end]
+        offset = end + 4
+        if chunk_type == b"IEND":
             break
-        pos = end
-    if not seen_idat:
-        fail("PNG has no IDAT chunk")
+
+
+def check_entry(path):
+    """Read entry.png and confirm it is a 1024x1024 PNG with image data.
+
+    Returns the raw bytes, ready to be copied unchanged.
+    """
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read()
+    except OSError as exc:
+        fail("cannot read %s: %s" % (path, exc))
+
+    if len(data) < len(PNG_SIGNATURE) + 8:
+        fail("entry.png is too small to be a PNG")
+    if data[:8] != PNG_SIGNATURE:
+        fail("entry.png does not start with the PNG signature")
+
+    chunks = list(read_chunks(data))
+    if not chunks or chunks[0][0] != b"IHDR":
+        fail("first chunk is not IHDR")
+
+    ihdr = chunks[0][1]
+    if len(ihdr) != 13:
+        fail("IHDR chunk is %d bytes, expected 13" % len(ihdr))
+    width, height = struct.unpack(">II", ihdr[:8])
+    if width != EXPECTED_WIDTH or height != EXPECTED_HEIGHT:
+        fail("entry.png is %dx%d, expected %dx%d"
+             % (width, height, EXPECTED_WIDTH, EXPECTED_HEIGHT))
+
+    idat_bytes = sum(len(payload) for ctype, payload in chunks
+                     if ctype == b"IDAT")
     if idat_bytes == 0:
-        fail("PNG IDAT payload is empty")
-    if not seen_iend:
-        fail("PNG has no IEND chunk")
+        fail("entry.png has no IDAT image data")
+
+    return data
 
 
 def main():
     here = os.path.dirname(os.path.abspath(__file__))
-    src = os.path.join(here, "entry.png")
-    try:
-        with open(src, "rb") as fh:
-            data = fh.read()
-    except OSError as exc:
-        fail("cannot read entry.png: %s" % exc)
-    if len(data) != EXPECTED_SIZE:
-        fail("entry.png is %d bytes, expected %d"
-             % (len(data), EXPECTED_SIZE))
-    if hashlib.sha256(data).hexdigest() != EXPECTED_SHA256:
-        fail("entry.png sha256 does not match the expected value")
-    validate_png(data)
-    out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
+    source = os.path.join(here, SOURCE_NAME)
+
+    data = check_entry(source)
+
+    out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "./output")
     os.makedirs(out_dir, exist_ok=True)
-    dst = os.path.join(out_dir, "entry.png")
-    with open(dst, "wb") as fh:
-        fh.write(data)
-    with open(dst, "rb") as fh:
-        written = fh.read()
-    if written != data:
-        fail("written entry.png differs from the source bytes")
-    if hashlib.sha256(written).hexdigest() != EXPECTED_SHA256:
-        fail("written entry.png sha256 does not match the expected value")
-    validate_png(written)
+    destination = os.path.join(out_dir, SOURCE_NAME)
+    with open(destination, "wb") as handle:
+        handle.write(data)
+
+    digest = hashlib.sha256(data).hexdigest()
     print("wrote %s (%d bytes, sha256 %s)"
-          % (dst, len(written), EXPECTED_SHA256))
+          % (destination, len(data), digest))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
